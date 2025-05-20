@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Text to Video Creator</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <h1>Text to Video Creator</h1>
+    <form id="videoForm">
+        <div>
+            <label for="videoText">Text for video:</label><br>
+            <textarea id="videoText" name="videoText" rows="4" cols="50" required></textarea>
+        </div>
+        <div>
+            <label for="backgroundColor">Background Color:</label><br>
+            <input type="color" id="backgroundColor" name="backgroundColor" value="#ffffff" required>
+        </div>
+        <div>
+            <button type="submit">Create Video</button>
+        </div>
+    </form>
+    <div id="videoOutput">
+        <!-- Video will be rendered here -->
+    </div>
+    <script src="script.js"></script>
+</body>
+</html>

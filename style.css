@@ -1,0 +1,73 @@
+body {
+    font-family: sans-serif;
+    margin: 20px;
+    background-color: #f4f4f4;
+    color: #333;
+}
+
+h1 {
+    color: #333;
+    text-align: center;
+}
+
+form {
+    background: #fff;
+    padding: 20px;
+    border-radius: 8px;
+    box-shadow: 0 0 10px rgba(0, 0, 0, 0.1);
+    max-width: 500px;
+    margin: 20px auto;
+}
+
+label {
+    display: block;
+    margin-bottom: 8px;
+    font-weight: bold;
+}
+
+textarea,
+input[type="color"],
+button {
+    width: calc(100% - 22px); /* Adjust width to account for padding/border */
+    padding: 10px;
+    margin-bottom: 20px;
+    border-radius: 4px;
+    border: 1px solid #ddd;
+    box-sizing: border-box; /* Include padding and border in the element's total width and height */
+}
+
+textarea {
+    resize: vertical; /* Allow vertical resizing */
+}
+
+input[type="color"] {
+    height: 40px; /* Specific height for color input for better UI */
+}
+
+button {
+    background-color: #007bff;
+    color: white;
+    border: none;
+    cursor: pointer;
+    font-size: 16px;
+}
+
+button:hover {
+    background-color: #0056b3;
+}
+
+#videoOutput {
+    margin-top: 30px;
+    text-align: center;
+    padding: 20px;
+    background: #fff;
+    border-radius: 8px;
+    box-shadow: 0 0 10px rgba(0, 0, 0, 0.1);
+    max-width: 500px;
+    margin: 20px auto;
+    min-height: 200px; /* Minimum height for the output area */
+    display: flex; /* For centering content if needed */
+    justify-content: center; /* For centering content if needed */
+    align-items: center; /* For centering content if needed */
+    border: 1px dashed #ddd;
+}
