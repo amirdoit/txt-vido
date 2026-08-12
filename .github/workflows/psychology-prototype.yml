@@ -1,6 +1,8 @@
 name: Psychology faceless video prototype
 
 on:
+  push:
+    branches: [psychology-video-proper-stack-20260811]
   workflow_dispatch:
 
 jobs:
