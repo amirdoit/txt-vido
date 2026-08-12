@@ -1,0 +1,156 @@
+name: Psychology faceless video prototype
+
+on:
+  workflow_dispatch:
+
+jobs:
+  render:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg cmake make libsdl2-dev libnss3 libdbus-1-3 libatk1.0-0 libgbm-dev libasound2 libxrandr2 libxkbcommon-dev libxfixes3 libxcomposite1 libxdamage1 libatk-bridge2.0-0 libpango-1.0-0 libcairo2 libcups2
+          python3 -m pip install --user yt-dlp
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Get purpose-selected vertical footage
+        run: |
+          mkdir -p assets
+          download() {
+            url="$1"; out="$2"
+            python3 -m yt_dlp --no-playlist -f 'best[ext=mp4]/best' -o "$out" "$url" || true
+          }
+          download 'https://www.pexels.com/video/a-woman-yawning-while-lying-on-the-bed-6753380/' 'assets/bed.mp4'
+          download 'https://www.pexels.com/video/face-of-a-woman-reflected-in-the-mirror-6764080/' 'assets/mirror.mp4'
+          download 'https://www.pexels.com/video/bustling-city-sidewalk-with-diverse-crowd-31983536/' 'assets/crowd.mp4'
+          download 'https://www.pexels.com/video/woman-lying-down-in-bed-7214655/' 'assets/rumination.mp4'
+          ls -lh assets
+          test -s assets/bed.mp4
+          test -s assets/mirror.mp4
+          test -s assets/crowd.mp4
+          test -s assets/rumination.mp4
+
+      - name: Clone real Short Video Maker
+        run: git clone --depth 1 https://github.com/gyoridavid/short-video-maker.git svm
+
+      - name: Replace only the stock-search adapter with curated local assets
+        run: |
+          cat > svm/src/short-creator/libraries/Pexels.ts <<'TS'
+          import { OrientationEnum, type Video } from "../../types/shorts";
+          const clips = [
+            "http://127.0.0.1:8765/bed.mp4",
+            "http://127.0.0.1:8765/mirror.mp4",
+            "http://127.0.0.1:8765/crowd.mp4",
+            "http://127.0.0.1:8765/rumination.mp4",
+          ];
+          let index = 0;
+          export class PexelsAPI {
+            constructor(_apiKey: string) {}
+            async findVideo(_searchTerms: string[], _minDurationSeconds: number, _excludeIds: string[] = [], _orientation: OrientationEnum = OrientationEnum.portrait): Promise<Video> {
+              const url = clips[index++ % clips.length];
+              return { id: String(index), url, width: 1080, height: 1920 };
+            }
+          }
+          TS
+
+      - name: Install and build Short Video Maker
+        working-directory: svm
+        run: npm ci && npm run build
+
+      - name: Start asset server and Short Video Maker
+        run: |
+          python3 -m http.server 8765 --directory assets > /tmp/assets.log 2>&1 &
+          mkdir -p rendered
+          cd svm
+          PEXELS_API_KEY=dummy \
+          DATA_DIR_PATH="$GITHUB_WORKSPACE/rendered" \
+          KOKORO_MODEL_PRECISION=q8 \
+          WHISPER_MODEL=tiny.en \
+          CONCURRENCY=1 \
+          VIDEO_CACHE_SIZE_IN_BYTES=2147483648 \
+          LOG_LEVEL=info \
+          npm start > /tmp/svm.log 2>&1 &
+          for i in $(seq 1 90); do
+            if curl -fsS http://127.0.0.1:3123/health; then exit 0; fi
+            sleep 2
+          done
+          cat /tmp/svm.log
+          exit 1
+
+      - name: Render psychology prototype with Kokoro + Whisper + Remotion
+        run: |
+          cat > /tmp/request.json <<'JSON'
+          {
+            "scenes": [
+              {
+                "text": "Ever notice how your brain waits until you're trying to sleep... then suddenly plays the most embarrassing moment of your life?",
+                "searchTerms": ["insomnia", "bed", "night"]
+              },
+              {
+                "text": "Here's the weird part. The memory probably feels far more important to you than it ever did to everyone else.",
+                "searchTerms": ["reflection", "thinking", "mirror"]
+              },
+              {
+                "text": "Psychologists call part of this the spotlight effect. We tend to overestimate how much other people notice our mistakes, awkward moments, and appearance.",
+                "searchTerms": ["crowd", "people", "street"]
+              },
+              {
+                "text": "And at night, there are fewer distractions. Your attention turns inward, so unfinished worries and social memories suddenly get the whole stage.",
+                "searchTerms": ["anxiety", "thinking", "bed"]
+              },
+              {
+                "text": "So when your brain resurrects something painful from five years ago, remember: everyone else was probably too busy thinking about themselves to archive your mistake.",
+                "searchTerms": ["sleep", "calm", "night"]
+              },
+              {
+                "text": "Your brain remembers the cringe. The room probably doesn't.",
+                "searchTerms": ["reflection", "calm", "mirror"]
+              }
+            ],
+            "config": {
+              "paddingBack": 900,
+              "music": "dark",
+              "captionPosition": "center",
+              "captionBackgroundColor": "rgba(0,0,0,0.72)",
+              "voice": "am_onyx",
+              "orientation": "portrait",
+              "musicVolume": "low"
+            }
+          }
+          JSON
+          response=$(curl -fsS -X POST http://127.0.0.1:3123/api/short-video -H 'Content-Type: application/json' --data-binary @/tmp/request.json)
+          echo "$response"
+          id=$(echo "$response" | python3 -c 'import json,sys; print(json.load(sys.stdin)["videoId"])')
+          for i in $(seq 1 180); do
+            status=$(curl -fsS "http://127.0.0.1:3123/api/short-video/$id/status")
+            echo "$status"
+            if echo "$status" | grep -q '"ready"'; then
+              curl -fsS "http://127.0.0.1:3123/api/short-video/$id" -o psychology-human-behavior-prototype.mp4
+              break
+            fi
+            if echo "$status" | grep -q '"failed"'; then
+              cat /tmp/svm.log
+              exit 1
+            fi
+            sleep 5
+          done
+          test -s psychology-human-behavior-prototype.mp4
+          ffprobe -v error -show_entries format=duration,size -of default=noprint_wrappers=1 psychology-human-behavior-prototype.mp4
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: psychology-human-behavior-prototype
+          path: psychology-human-behavior-prototype.mp4
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Print renderer log on failure
+        if: failure()
+        run: cat /tmp/svm.log || true
