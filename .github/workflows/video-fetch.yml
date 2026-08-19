@@ -16,13 +16,23 @@ permissions:
 
 jobs:
   fetch-video:
+    # This repository is public. Only Amir's same-repo intake branches may receive
+    # the cloud proxy secret. Fork PRs are never allowed to run the trusted path.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.pull_request.head.repo.full_name == github.repository && github.actor == 'amirdoit')
     runs-on: ubuntu-latest
     timeout-minutes: 12
     env:
+      # Vendor-neutral secret. Initial recommended provider: Decodo residential.
+      # Example shape only; never commit the real value:
+      # http://user-...-session-videointake-sessionduration-30:PASSWORD@gate.decodo.com:7000
+      VIDEO_RESIDENTIAL_PROXY_URL: ${{ secrets.VIDEO_RESIDENTIAL_PROXY_URL }}
+      # Optional secondary fallback for edge cases that genuinely require login.
       YOUTUBE_COOKIES_B64: ${{ secrets.YOUTUBE_COOKIES_B64 }}
 
     steps:
-      - name: Check out repository
+      - name: Check out trusted request branch
         uses: actions/checkout@v4
 
       - name: Set up Python
@@ -50,11 +60,11 @@ jobs:
           printf 'url=%s\n' "$URL" >> "$GITHUB_OUTPUT"
           printf 'VIDEO_URL=%s\n' "$URL" >> "$GITHUB_ENV"
 
-      - name: Install yt-dlp
+      - name: Install cloud fetch stack
         shell: bash
         run: |
           set -euo pipefail
-          python -m pip install --disable-pip-version-check 'yt-dlp[default]==2026.7.4'
+          python -m pip install --disable-pip-version-check 'yt-dlp[default,curl-cffi]==2026.7.4'
           yt-dlp --version
           node --version || true
 
@@ -86,34 +96,65 @@ jobs:
             yt-dlp "${common[@]}" "$@" "$VIDEO_URL" 2>&1 | tee -a fetched/download.log
           }
 
-          # Tier 1: direct yt-dlp. Fastest path for platforms/hosts that allow it.
-          if attempt default; then
-            exit 0
-          fi
-
-          # Tier 2: federated YouTube frontends on independent networks.
-          # These return progressive proxied streams and avoid depending on this runner's IP.
+          is_youtube=0
           if [[ "$VIDEO_URL" == *youtube.com* || "$VIDEO_URL" == *youtu.be* ]]; then
-            echo '=== attempt: federated-piped-invidious ===' | tee -a fetched/download.log
-            if python tools/reference_video_fallback.py "$VIDEO_URL" --output fetched 2>&1 | tee -a fetched/download.log; then
-              exit 0
-            fi
+            is_youtube=1
           fi
 
-          # Tier 3: optional authenticated cookie fallback. The secret is never printed.
-          # Once YOUTUBE_COOKIES_B64 is configured, it automatically handles bot/login gates.
-          if [[ "$VIDEO_URL" == *youtube.com* || "$VIDEO_URL" == *youtu.be* ]] && [[ -n "${YOUTUBE_COOKIES_B64:-}" ]]; then
+          # Tier 1 for YouTube: cloud compute + residential egress. A sticky session
+          # keeps extraction and media requests on the same residential IP.
+          if [[ "$is_youtube" == 1 && -n "${VIDEO_RESIDENTIAL_PROXY_URL:-}" ]]; then
+            echo 'Residential cloud egress: configured' | tee -a fetched/download.log
+            attempt residential-default \
+              --proxy "$VIDEO_RESIDENTIAL_PROXY_URL" \
+              --impersonate chrome && exit 0
+            attempt residential-mweb \
+              --proxy "$VIDEO_RESIDENTIAL_PROXY_URL" \
+              --impersonate chrome \
+              --extractor-args 'youtube:player_client=mweb' && exit 0
+            attempt residential-web-safari \
+              --proxy "$VIDEO_RESIDENTIAL_PROXY_URL" \
+              --extractor-args 'youtube:player_client=web_safari' && exit 0
+            attempt residential-web-embedded \
+              --proxy "$VIDEO_RESIDENTIAL_PROXY_URL" \
+              --impersonate chrome \
+              --extractor-args 'youtube:player_client=web_embedded' && exit 0
+          elif [[ "$is_youtube" == 1 ]]; then
+            echo 'Residential cloud egress: NOT CONFIGURED (missing VIDEO_RESIDENTIAL_PROXY_URL secret)' |
+              tee -a fetched/download.log
+          fi
+
+          # Tier 2: authenticated cloud fetch through the same residential egress.
+          # This is optional and should not be required for normal public Shorts.
+          if [[ "$is_youtube" == 1 && -n "${VIDEO_RESIDENTIAL_PROXY_URL:-}" && -n "${YOUTUBE_COOKIES_B64:-}" ]]; then
             printf '%s' "$YOUTUBE_COOKIES_B64" | base64 --decode > fetched/youtube-cookies.txt
             chmod 600 fetched/youtube-cookies.txt
-            if attempt cookies --cookies fetched/youtube-cookies.txt; then
+            if attempt residential-cookies \
+              --proxy "$VIDEO_RESIDENTIAL_PROXY_URL" \
+              --impersonate chrome \
+              --cookies fetched/youtube-cookies.txt; then
               rm -f fetched/youtube-cookies.txt
               exit 0
             fi
             rm -f fetched/youtube-cookies.txt
           fi
 
-          # Tier 4: PO-token provider plus alternate YouTube clients.
-          if [[ "$VIDEO_URL" == *youtube.com* || "$VIDEO_URL" == *youtu.be* ]]; then
+          # Tier 3: ordinary public path. Useful for non-YouTube services and for
+          # YouTube when a hosted runner is not currently challenged.
+          attempt direct && exit 0
+
+          # Tier 4: independent public frontends. Free best-effort fallback only.
+          if [[ "$is_youtube" == 1 ]]; then
+            echo '=== attempt: federated-piped-invidious ===' | tee -a fetched/download.log
+            if python tools/reference_video_fallback.py "$VIDEO_URL" --output fetched 2>&1 |
+              tee -a fetched/download.log; then
+              exit 0
+            fi
+          fi
+
+          # Tier 5: PO-token provider. When residential egress is configured, the
+          # actual media extraction still leaves through that proxy.
+          if [[ "$is_youtube" == 1 ]]; then
             python -m pip install --disable-pip-version-check 'bgutil-ytdlp-pot-provider==1.3.1'
             docker run -d --name bgutil-provider -p 4416:4416 --init \
               brainicism/bgutil-ytdlp-pot-provider:1.3.1
@@ -126,18 +167,27 @@ jobs:
               fi
               sleep 1
             done
+
             if [[ "$ready" == 1 ]]; then
-              attempt po-default && exit 0
-              attempt po-mweb --extractor-args 'youtube:player_client=mweb' && exit 0
-              attempt po-web-safari --extractor-args 'youtube:player_client=web_safari' && exit 0
-              attempt po-web-embedded --extractor-args 'youtube:player_client=web_embedded' && exit 0
+              if [[ -n "${VIDEO_RESIDENTIAL_PROXY_URL:-}" ]]; then
+                attempt po-residential \
+                  --proxy "$VIDEO_RESIDENTIAL_PROXY_URL" \
+                  --impersonate chrome && exit 0
+              else
+                attempt po-direct && exit 0
+              fi
             else
               docker logs bgutil-provider || true
               echo 'PO-token provider failed to start' | tee -a fetched/download.log
             fi
           fi
 
-          echo 'All fetch strategies failed' >&2
+          rm -f fetched/youtube-cookies.txt
+          echo 'All cloud fetch strategies failed.' | tee -a fetched/download.log >&2
+          if [[ "$is_youtube" == 1 && -z "${VIDEO_RESIDENTIAL_PROXY_URL:-}" ]]; then
+            echo 'BLOCKER=VIDEO_RESIDENTIAL_PROXY_URL secret is not configured.' |
+              tee -a fetched/download.log >&2
+          fi
           exit 4
 
       - name: Build fetch manifest
@@ -145,7 +195,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          VIDEO="$(find fetched -maxdepth 1 -type f -name 'source.*' ! -name '*.json' ! -name '*.description' ! -name '*.vtt' ! -name '*.webp' ! -name '*.jpg' ! -name '*.txt' | head -1)"
+          VIDEO="$(find fetched -maxdepth 1 -type f -name 'source.*' \
+            ! -name '*.json' ! -name '*.description' ! -name '*.vtt' \
+            ! -name '*.webp' ! -name '*.jpg' ! -name '*.txt' | head -1)"
           [[ -n "$VIDEO" ]] || { echo 'No source video found' >&2; exit 5; }
           python - <<PY
           import hashlib, json
@@ -153,21 +205,14 @@ jobs:
           video=Path('$VIDEO')
           h=hashlib.sha256(video.read_bytes()).hexdigest()
           vtts=sorted(str(p.name) for p in Path('fetched').glob('*.vtt'))
-          federated={}
-          fi=Path('fetched/federated-info.json')
-          if fi.exists():
-              try:
-                  raw=json.loads(fi.read_text())
-                  federated={'provider': raw.get('provider'), 'api': raw.get('api')}
-              except Exception:
-                  pass
           manifest={
               'source_url': '''$VIDEO_URL''',
               'source_file': video.name,
               'source_sha256': h,
+              'fetch_path': 'cloud',
+              'residential_proxy_configured': bool('''${VIDEO_RESIDENTIAL_PROXY_URL:+yes}'''),
               'yt_dlp_version': '2026.07.04',
               'captions': vtts,
-              **federated,
           }
           Path('fetched/fetch-manifest.json').write_text(json.dumps(manifest, indent=2), encoding='utf-8')
           PY
@@ -181,3 +226,12 @@ jobs:
           path: fetched/
           if-no-files-found: error
           retention-days: 7
+
+      - name: Upload diagnostics on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: video-fetch-diagnostics-${{ github.run_id }}
+          path: fetched/download.log
+          if-no-files-found: ignore
+          retention-days: 2
