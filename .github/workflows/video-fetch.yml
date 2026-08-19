@@ -1,0 +1,151 @@
+name: Video Fetch Worker
+
+on:
+  pull_request:
+    paths:
+      - '.video-fetch/request.json'
+  workflow_dispatch:
+    inputs:
+      url:
+        description: 'Public video URL to fetch'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  fetch-video:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Resolve request
+        id: request
+        shell: bash
+        env:
+          DISPATCH_URL: ${{ github.event.inputs.url }}
+        run: |
+          set -euo pipefail
+          if [[ -n "${DISPATCH_URL:-}" ]]; then
+            URL="$DISPATCH_URL"
+          else
+            URL="$(python - <<'PY'
+          import json
+          print(json.load(open('.video-fetch/request.json'))['url'])
+          PY
+          )"
+          fi
+          [[ "$URL" =~ ^https?:// ]] || { echo 'Refusing non-HTTP(S) URL' >&2; exit 2; }
+          printf 'url=%s\n' "$URL" >> "$GITHUB_OUTPUT"
+          printf 'VIDEO_URL=%s\n' "$URL" >> "$GITHUB_ENV"
+
+      - name: Install yt-dlp
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check 'yt-dlp[default]==2026.7.4'
+          yt-dlp --version
+          node --version || true
+
+      - name: Fetch video and captions
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p fetched
+
+          common=(
+            --no-playlist
+            --write-info-json
+            --write-description
+            --write-thumbnail
+            --write-subs
+            --write-auto-subs
+            --sub-langs 'en.*,en'
+            --sub-format 'vtt/best'
+            --js-runtimes node
+            -f '18/best[ext=mp4][acodec!=none][vcodec!=none]/best[acodec!=none][vcodec!=none]'
+            -o 'fetched/source.%(ext)s'
+          )
+
+          attempt() {
+            local label="$1"
+            shift
+            echo "=== attempt: $label ===" | tee -a fetched/download.log
+            rm -f fetched/source.part fetched/source.ytdl
+            yt-dlp "${common[@]}" "$@" "$VIDEO_URL" 2>&1 | tee -a fetched/download.log
+          }
+
+          # Fast path: most public videos should finish here with no container startup.
+          if attempt default; then
+            exit 0
+          fi
+
+          # Hardened YouTube fallback: install a PO-token provider only when required.
+          if [[ "$VIDEO_URL" == *youtube.com* || "$VIDEO_URL" == *youtu.be* ]]; then
+            python -m pip install --disable-pip-version-check 'bgutil-ytdlp-pot-provider==1.3.1'
+            docker run -d --name bgutil-provider -p 4416:4416 --init \
+              brainicism/bgutil-ytdlp-pot-provider:1.3.1
+
+            ready=0
+            for i in {1..90}; do
+              if (echo > /dev/tcp/127.0.0.1/4416) >/dev/null 2>&1; then
+                ready=1
+                break
+              fi
+              sleep 1
+            done
+            if [[ "$ready" != 1 ]]; then
+              docker logs bgutil-provider || true
+              echo 'PO-token provider failed to start' >&2
+              exit 3
+            fi
+
+            attempt po-default && exit 0
+            attempt po-mweb --extractor-args 'youtube:player_client=mweb' && exit 0
+            attempt po-web-safari --extractor-args 'youtube:player_client=web_safari' && exit 0
+            attempt po-web-embedded --extractor-args 'youtube:player_client=web_embedded' && exit 0
+          fi
+
+          echo 'All fetch strategies failed' >&2
+          exit 4
+
+      - name: Build fetch manifest
+        if: success()
+        shell: bash
+        run: |
+          set -euo pipefail
+          VIDEO="$(find fetched -maxdepth 1 -type f -name 'source.*' ! -name '*.json' ! -name '*.description' ! -name '*.vtt' ! -name '*.webp' ! -name '*.jpg' | head -1)"
+          [[ -n "$VIDEO" ]] || { echo 'No source video found' >&2; exit 5; }
+          python - <<PY
+          import hashlib, json
+          from pathlib import Path
+          video=Path('$VIDEO')
+          h=hashlib.sha256(video.read_bytes()).hexdigest()
+          vtts=sorted(str(p.name) for p in Path('fetched').glob('*.vtt'))
+          manifest={
+              'source_url': '''$VIDEO_URL''',
+              'source_file': video.name,
+              'source_sha256': h,
+              'yt_dlp_version': '2026.07.04',
+              'captions': vtts,
+          }
+          Path('fetched/fetch-manifest.json').write_text(json.dumps(manifest, indent=2), encoding='utf-8')
+          PY
+
+      - name: Upload fetched source
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: video-fetch-${{ github.run_id }}
+          path: fetched/
+          if-no-files-found: error
+          retention-days: 7
