@@ -18,6 +18,8 @@ jobs:
   fetch-video:
     runs-on: ubuntu-latest
     timeout-minutes: 12
+    env:
+      YOUTUBE_COOKIES_B64: ${{ secrets.YOUTUBE_COOKIES_B64 }}
 
     steps:
       - name: Check out repository
@@ -84,12 +86,33 @@ jobs:
             yt-dlp "${common[@]}" "$@" "$VIDEO_URL" 2>&1 | tee -a fetched/download.log
           }
 
-          # Fast path: most public videos should finish here with no container startup.
+          # Tier 1: direct yt-dlp. Fastest path for platforms/hosts that allow it.
           if attempt default; then
             exit 0
           fi
 
-          # Hardened YouTube fallback: install a PO-token provider only when required.
+          # Tier 2: federated YouTube frontends on independent networks.
+          # These return progressive proxied streams and avoid depending on this runner's IP.
+          if [[ "$VIDEO_URL" == *youtube.com* || "$VIDEO_URL" == *youtu.be* ]]; then
+            echo '=== attempt: federated-piped-invidious ===' | tee -a fetched/download.log
+            if python tools/reference_video_fallback.py "$VIDEO_URL" --output fetched 2>&1 | tee -a fetched/download.log; then
+              exit 0
+            fi
+          fi
+
+          # Tier 3: optional authenticated cookie fallback. The secret is never printed.
+          # Once YOUTUBE_COOKIES_B64 is configured, it automatically handles bot/login gates.
+          if [[ "$VIDEO_URL" == *youtube.com* || "$VIDEO_URL" == *youtu.be* ]] && [[ -n "${YOUTUBE_COOKIES_B64:-}" ]]; then
+            printf '%s' "$YOUTUBE_COOKIES_B64" | base64 --decode > fetched/youtube-cookies.txt
+            chmod 600 fetched/youtube-cookies.txt
+            if attempt cookies --cookies fetched/youtube-cookies.txt; then
+              rm -f fetched/youtube-cookies.txt
+              exit 0
+            fi
+            rm -f fetched/youtube-cookies.txt
+          fi
+
+          # Tier 4: PO-token provider plus alternate YouTube clients.
           if [[ "$VIDEO_URL" == *youtube.com* || "$VIDEO_URL" == *youtu.be* ]]; then
             python -m pip install --disable-pip-version-check 'bgutil-ytdlp-pot-provider==1.3.1'
             docker run -d --name bgutil-provider -p 4416:4416 --init \
@@ -103,16 +126,15 @@ jobs:
               fi
               sleep 1
             done
-            if [[ "$ready" != 1 ]]; then
+            if [[ "$ready" == 1 ]]; then
+              attempt po-default && exit 0
+              attempt po-mweb --extractor-args 'youtube:player_client=mweb' && exit 0
+              attempt po-web-safari --extractor-args 'youtube:player_client=web_safari' && exit 0
+              attempt po-web-embedded --extractor-args 'youtube:player_client=web_embedded' && exit 0
+            else
               docker logs bgutil-provider || true
-              echo 'PO-token provider failed to start' >&2
-              exit 3
+              echo 'PO-token provider failed to start' | tee -a fetched/download.log
             fi
-
-            attempt po-default && exit 0
-            attempt po-mweb --extractor-args 'youtube:player_client=mweb' && exit 0
-            attempt po-web-safari --extractor-args 'youtube:player_client=web_safari' && exit 0
-            attempt po-web-embedded --extractor-args 'youtube:player_client=web_embedded' && exit 0
           fi
 
           echo 'All fetch strategies failed' >&2
@@ -123,7 +145,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          VIDEO="$(find fetched -maxdepth 1 -type f -name 'source.*' ! -name '*.json' ! -name '*.description' ! -name '*.vtt' ! -name '*.webp' ! -name '*.jpg' | head -1)"
+          VIDEO="$(find fetched -maxdepth 1 -type f -name 'source.*' ! -name '*.json' ! -name '*.description' ! -name '*.vtt' ! -name '*.webp' ! -name '*.jpg' ! -name '*.txt' | head -1)"
           [[ -n "$VIDEO" ]] || { echo 'No source video found' >&2; exit 5; }
           python - <<PY
           import hashlib, json
@@ -131,15 +153,25 @@ jobs:
           video=Path('$VIDEO')
           h=hashlib.sha256(video.read_bytes()).hexdigest()
           vtts=sorted(str(p.name) for p in Path('fetched').glob('*.vtt'))
+          federated={}
+          fi=Path('fetched/federated-info.json')
+          if fi.exists():
+              try:
+                  raw=json.loads(fi.read_text())
+                  federated={'provider': raw.get('provider'), 'api': raw.get('api')}
+              except Exception:
+                  pass
           manifest={
               'source_url': '''$VIDEO_URL''',
               'source_file': video.name,
               'source_sha256': h,
               'yt_dlp_version': '2026.07.04',
               'captions': vtts,
+              **federated,
           }
           Path('fetched/fetch-manifest.json').write_text(json.dumps(manifest, indent=2), encoding='utf-8')
           PY
+          rm -f fetched/youtube-cookies.txt
 
       - name: Upload fetched source
         if: success()
