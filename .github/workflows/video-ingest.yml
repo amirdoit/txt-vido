@@ -4,6 +4,9 @@ on:
   push:
     paths:
       - '.video-ingest/request.json'
+  pull_request:
+    paths:
+      - '.video-ingest/request.json'
   workflow_dispatch:
     inputs:
       url:
@@ -147,18 +150,15 @@ jobs:
           ffprobe -v quiet -print_format json -show_format -show_streams ingest/source.mp4 > ingest/probe.json
           ffmpeg -hide_banner -loglevel error -y -i ingest/source.mp4 -vn -ac 1 -ar 16000 ingest/audio.wav
 
-          # One analysis frame per second. Shorts max out at a manageable number of frames.
           ffmpeg -hide_banner -loglevel error -y -i ingest/source.mp4 \
             -vf "fps=1,scale='min(720,iw)':-2" -q:v 3 ingest/frames/frame_%04d.jpg
 
-          # Harder scene changes for cut/pacing analysis. A no-match is valid for very static videos.
           ffmpeg -hide_banner -loglevel error -y -i ingest/source.mp4 \
             -vf "select='gt(scene,0.22)',scale='min(720,iw)':-2" -fps_mode vfr -q:v 2 \
             ingest/scene-cuts/cut_%04d.jpg || true
 
-          # Uniform 20-frame contact sheet across the full video.
           python - <<'PY'
-          import json, math, subprocess
+          import json, subprocess
           from pathlib import Path
           probe = json.loads(Path('ingest/probe.json').read_text())
           duration = float(probe.get('format', {}).get('duration') or 0)
