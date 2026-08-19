@@ -16,19 +16,23 @@ permissions:
 
 jobs:
   fetch-video:
-    # This repository is public. Only Amir's same-repo intake branches may receive
-    # the cloud proxy secret. Fork PRs are never allowed to run the trusted path.
+    # Public repository safety: trusted same-repo requests only. Fork PRs must
+    # never receive cloud provider credentials.
     if: >-
       github.event_name == 'workflow_dispatch' ||
       (github.event.pull_request.head.repo.full_name == github.repository && github.actor == 'amirdoit')
     runs-on: ubuntu-latest
     timeout-minutes: 12
     env:
-      # Vendor-neutral secret. Initial recommended provider: Decodo residential.
-      # Example shape only; never commit the real value:
-      # http://user-...-session-videointake-sessionduration-30:PASSWORD@gate.decodo.com:7000
+      # Primary cloud path. Apify actor runs YouTube downloads in Apify cloud
+      # with residential proxy support and stores the resulting MP4 remotely.
+      APIFY_TOKEN: ${{ secrets.APIFY_TOKEN }}
+
+      # Secondary provider-neutral egress path. Optional. Initial recommended
+      # implementation if needed later: a sticky Decodo residential proxy URL.
       VIDEO_RESIDENTIAL_PROXY_URL: ${{ secrets.VIDEO_RESIDENTIAL_PROXY_URL }}
-      # Optional secondary fallback for edge cases that genuinely require login.
+
+      # Optional final fallback for genuinely login-gated YouTube content.
       YOUTUBE_COOKIES_B64: ${{ secrets.YOUTUBE_COOKIES_B64 }}
 
     steps:
@@ -59,8 +63,93 @@ jobs:
           [[ "$URL" =~ ^https?:// ]] || { echo 'Refusing non-HTTP(S) URL' >&2; exit 2; }
           printf 'url=%s\n' "$URL" >> "$GITHUB_OUTPUT"
           printf 'VIDEO_URL=%s\n' "$URL" >> "$GITHUB_ENV"
+          mkdir -p fetched
 
-      - name: Install cloud fetch stack
+      - name: Primary cloud fetch through Apify
+        id: apify
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${APIFY_TOKEN:-}" ]]; then
+            echo 'Apify cloud fetch: NOT CONFIGURED (missing APIFY_TOKEN secret)' |
+              tee -a fetched/download.log
+            exit 0
+          fi
+
+          echo '=== attempt: apify-residential-cloud ===' | tee -a fetched/download.log
+
+          python - <<'PY'
+          import json, os
+          payload = {
+              'urls': [os.environ['VIDEO_URL']],
+              'quality': '720',
+              'audioOnly': False,
+              'subtitles': True,
+              'subLangs': 'en',
+              'includeMetadata': True,
+              # Cost/safety ceiling. Typical Shorts are only a few MB.
+              'maxMegabytes': 150,
+              'proxyConfiguration': {
+                  'useApifyProxy': True,
+                  'apifyProxyGroups': ['RESIDENTIAL'],
+              },
+          }
+          with open('fetched/apify-input.json', 'w', encoding='utf-8') as f:
+              json.dump(payload, f)
+          PY
+
+          status=0
+          curl --fail-with-body --silent --show-error --location \
+            --max-time 330 \
+            --header "Authorization: Bearer $APIFY_TOKEN" \
+            --header 'Content-Type: application/json' \
+            --data @fetched/apify-input.json \
+            'https://api.apify.com/v2/acts/dami_studio~youtube-video-downloader/run-sync-get-dataset-items?timeout=300' \
+            > fetched/apify-response.json || status=$?
+
+          rm -f fetched/apify-input.json
+
+          if [[ "$status" != 0 ]]; then
+            echo "Apify request failed with curl status $status" | tee -a fetched/download.log
+            exit 0
+          fi
+
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          p = Path('fetched/apify-response.json')
+          try:
+              data = json.loads(p.read_text(encoding='utf-8'))
+          except Exception as exc:
+              print(f'Invalid Apify JSON: {exc}')
+              raise SystemExit(0)
+          row = data[0] if isinstance(data, list) and data else {}
+          media = row.get('mediaUrl') or row.get('download_url') or row.get('downloadUrl') or ''
+          if media:
+              Path('fetched/apify-media-url.txt').write_text(media, encoding='utf-8')
+          print('Apify dataset row received:', bool(row), 'media URL:', bool(media))
+          PY
+
+          if [[ ! -s fetched/apify-media-url.txt ]]; then
+            echo 'Apify actor returned no downloadable media URL.' | tee -a fetched/download.log
+            exit 0
+          fi
+
+          MEDIA_URL="$(cat fetched/apify-media-url.txt)"
+          if curl --fail --silent --show-error --location --max-time 300 \
+              "$MEDIA_URL" -o fetched/source.mp4; then
+            echo 'APIFY_FETCHED=1' >> "$GITHUB_ENV"
+            echo 'Apify cloud fetch succeeded.' | tee -a fetched/download.log
+          else
+            rm -f fetched/source.mp4
+            echo 'Apify media download failed; continuing to cloud fallbacks.' |
+              tee -a fetched/download.log
+          fi
+          rm -f fetched/apify-media-url.txt
+
+      - name: Install fallback fetch stack
+        if: env.APIFY_FETCHED != '1'
         shell: bash
         run: |
           set -euo pipefail
@@ -68,11 +157,11 @@ jobs:
           yt-dlp --version
           node --version || true
 
-      - name: Fetch video and captions
+      - name: Cloud fallback fetches
+        if: env.APIFY_FETCHED != '1'
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p fetched
 
           common=(
             --no-playlist
@@ -101,10 +190,9 @@ jobs:
             is_youtube=1
           fi
 
-          # Tier 1 for YouTube: cloud compute + residential egress. A sticky session
-          # keeps extraction and media requests on the same residential IP.
+          # Secondary cloud reliability boundary: residential/ISP proxy egress.
           if [[ "$is_youtube" == 1 && -n "${VIDEO_RESIDENTIAL_PROXY_URL:-}" ]]; then
-            echo 'Residential cloud egress: configured' | tee -a fetched/download.log
+            echo 'Secondary residential cloud egress: configured' | tee -a fetched/download.log
             attempt residential-default \
               --proxy "$VIDEO_RESIDENTIAL_PROXY_URL" \
               --impersonate chrome && exit 0
@@ -115,45 +203,39 @@ jobs:
             attempt residential-web-safari \
               --proxy "$VIDEO_RESIDENTIAL_PROXY_URL" \
               --extractor-args 'youtube:player_client=web_safari' && exit 0
-            attempt residential-web-embedded \
-              --proxy "$VIDEO_RESIDENTIAL_PROXY_URL" \
-              --impersonate chrome \
-              --extractor-args 'youtube:player_client=web_embedded' && exit 0
           elif [[ "$is_youtube" == 1 ]]; then
-            echo 'Residential cloud egress: NOT CONFIGURED (missing VIDEO_RESIDENTIAL_PROXY_URL secret)' |
+            echo 'Secondary residential cloud egress: NOT CONFIGURED' |
               tee -a fetched/download.log
           fi
 
-          # Tier 2: authenticated cloud fetch through the same residential egress.
-          # This is optional and should not be required for normal public Shorts.
+          # Optional cookies remain cloud-side and only ride through residential egress.
           if [[ "$is_youtube" == 1 && -n "${VIDEO_RESIDENTIAL_PROXY_URL:-}" && -n "${YOUTUBE_COOKIES_B64:-}" ]]; then
             printf '%s' "$YOUTUBE_COOKIES_B64" | base64 --decode > fetched/youtube-cookies.txt
             chmod 600 fetched/youtube-cookies.txt
             if attempt residential-cookies \
-              --proxy "$VIDEO_RESIDENTIAL_PROXY_URL" \
-              --impersonate chrome \
-              --cookies fetched/youtube-cookies.txt; then
+                --proxy "$VIDEO_RESIDENTIAL_PROXY_URL" \
+                --impersonate chrome \
+                --cookies fetched/youtube-cookies.txt; then
               rm -f fetched/youtube-cookies.txt
               exit 0
             fi
             rm -f fetched/youtube-cookies.txt
           fi
 
-          # Tier 3: ordinary public path. Useful for non-YouTube services and for
-          # YouTube when a hosted runner is not currently challenged.
+          # Free/best-effort routes. These are useful but not treated as the
+          # production reliability boundary.
           attempt direct && exit 0
 
-          # Tier 4: independent public frontends. Free best-effort fallback only.
           if [[ "$is_youtube" == 1 ]]; then
             echo '=== attempt: federated-piped-invidious ===' | tee -a fetched/download.log
             if python tools/reference_video_fallback.py "$VIDEO_URL" --output fetched 2>&1 |
-              tee -a fetched/download.log; then
+                tee -a fetched/download.log; then
               exit 0
             fi
           fi
 
-          # Tier 5: PO-token provider. When residential egress is configured, the
-          # actual media extraction still leaves through that proxy.
+          # Last free fallback: PO-token provider. Media requests still use the
+          # residential proxy when one is configured.
           if [[ "$is_youtube" == 1 ]]; then
             python -m pip install --disable-pip-version-check 'bgutil-ytdlp-pot-provider==1.3.1'
             docker run -d --name bgutil-provider -p 4416:4416 --init \
@@ -184,14 +266,13 @@ jobs:
 
           rm -f fetched/youtube-cookies.txt
           echo 'All cloud fetch strategies failed.' | tee -a fetched/download.log >&2
-          if [[ "$is_youtube" == 1 && -z "${VIDEO_RESIDENTIAL_PROXY_URL:-}" ]]; then
-            echo 'BLOCKER=VIDEO_RESIDENTIAL_PROXY_URL secret is not configured.' |
+          if [[ "$is_youtube" == 1 && -z "${APIFY_TOKEN:-}" && -z "${VIDEO_RESIDENTIAL_PROXY_URL:-}" ]]; then
+            echo 'BLOCKER=no production cloud egress credential is configured (APIFY_TOKEN or VIDEO_RESIDENTIAL_PROXY_URL).' |
               tee -a fetched/download.log >&2
           fi
           exit 4
 
       - name: Build fetch manifest
-        if: success()
         shell: bash
         run: |
           set -euo pipefail
@@ -200,17 +281,18 @@ jobs:
             ! -name '*.webp' ! -name '*.jpg' ! -name '*.txt' | head -1)"
           [[ -n "$VIDEO" ]] || { echo 'No source video found' >&2; exit 5; }
           python - <<PY
-          import hashlib, json
+          import hashlib, json, os
           from pathlib import Path
           video=Path('$VIDEO')
           h=hashlib.sha256(video.read_bytes()).hexdigest()
           vtts=sorted(str(p.name) for p in Path('fetched').glob('*.vtt'))
           manifest={
-              'source_url': '''$VIDEO_URL''',
+              'source_url': os.environ['VIDEO_URL'],
               'source_file': video.name,
               'source_sha256': h,
-              'fetch_path': 'cloud',
-              'residential_proxy_configured': bool('''${VIDEO_RESIDENTIAL_PROXY_URL:+yes}'''),
+              'fetch_path': 'apify-cloud' if os.environ.get('APIFY_FETCHED') == '1' else 'github-cloud-fallback',
+              'apify_configured': bool(os.environ.get('APIFY_TOKEN')),
+              'secondary_residential_proxy_configured': bool(os.environ.get('VIDEO_RESIDENTIAL_PROXY_URL')),
               'yt_dlp_version': '2026.07.04',
               'captions': vtts,
           }
@@ -219,7 +301,6 @@ jobs:
           rm -f fetched/youtube-cookies.txt
 
       - name: Upload fetched source
-        if: success()
         uses: actions/upload-artifact@v4
         with:
           name: video-fetch-${{ github.run_id }}
