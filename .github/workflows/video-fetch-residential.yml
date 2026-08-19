@@ -1,0 +1,162 @@
+name: Video Fetch Residential Worker
+
+on:
+  pull_request:
+    paths:
+      - '.video-fetch/request.json'
+  workflow_dispatch:
+    inputs:
+      url:
+        description: 'Public video URL to fetch'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  fetch-residential:
+    # SECURITY: this repository is public. Never schedule fork PRs on Amir's PC.
+    # Only same-repository branches created by Amir may reach the self-hosted runner.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.pull_request.head.repo.full_name == github.repository && github.actor == 'amirdoit')
+    runs-on: [self-hosted, Windows, X64, video-intake]
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out trusted request branch
+        uses: actions/checkout@v4
+
+      - name: Resolve request URL
+        id: request
+        shell: powershell
+        env:
+          DISPATCH_URL: ${{ github.event.inputs.url }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:DISPATCH_URL) {
+            $url = $env:DISPATCH_URL
+          } else {
+            $request = Get-Content '.video-fetch/request.json' -Raw | ConvertFrom-Json
+            $url = [string]$request.url
+          }
+          if ($url -notmatch '^https?://') {
+            throw 'Refusing non-HTTP(S) input URL.'
+          }
+          "VIDEO_URL=$url" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "url=$url" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: Prepare pinned yt-dlp
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $bin = Join-Path $env:RUNNER_TEMP 'video-intake-bin'
+          New-Item -ItemType Directory -Force -Path $bin | Out-Null
+          $exe = Join-Path $bin 'yt-dlp.exe'
+          $expected = '2026.07.04'
+          $uri = 'https://github.com/yt-dlp/yt-dlp/releases/download/2026.07.04/yt-dlp.exe'
+          if (-not (Test-Path $exe)) {
+            Invoke-WebRequest -Uri $uri -OutFile $exe -UseBasicParsing
+          }
+          $actual = (& $exe --version).Trim()
+          if ($actual -ne $expected) {
+            Remove-Item $exe -Force -ErrorAction SilentlyContinue
+            Invoke-WebRequest -Uri $uri -OutFile $exe -UseBasicParsing
+            $actual = (& $exe --version).Trim()
+          }
+          if ($actual -ne $expected) {
+            throw "yt-dlp version mismatch. Expected $expected, got $actual"
+          }
+          "YTDLP_EXE=$exe" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Fetch source from residential network
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Continue'
+          New-Item -ItemType Directory -Force -Path 'fetched' | Out-Null
+
+          $common = @(
+            '--no-playlist',
+            '--write-info-json',
+            '--write-description',
+            '--write-thumbnail',
+            '--write-subs',
+            '--write-auto-subs',
+            '--sub-langs', 'en.*,en',
+            '--sub-format', 'vtt/best',
+            '-f', '18/best[ext=mp4][acodec!=none][vcodec!=none]/best[acodec!=none][vcodec!=none]',
+            '-o', 'fetched/source.%(ext)s'
+          )
+
+          function Invoke-YtDlpAttempt {
+            param(
+              [Parameter(Mandatory=$true)][string]$Name,
+              [string[]]$Extra = @()
+            )
+            "=== attempt: $Name ===" | Tee-Object -FilePath 'fetched/download.log' -Append
+            Remove-Item 'fetched/source.part','fetched/source.ytdl' -Force -ErrorAction SilentlyContinue
+            & $env:YTDLP_EXE @common @Extra $env:VIDEO_URL 2>&1 |
+              Tee-Object -FilePath 'fetched/download.log' -Append
+            return ($LASTEXITCODE -eq 0)
+          }
+
+          # Tier 1: public video over Amir's normal residential connection.
+          # This is deliberately first: for normal public Shorts it avoids cookies entirely.
+          if (Invoke-YtDlpAttempt -Name 'residential-direct') { exit 0 }
+
+          # Tier 2: a dedicated local Netscape cookie file, if Amir ever chooses to create one.
+          # It lives outside the repository and is never uploaded as an artifact.
+          $localCookieFile = Join-Path $env:LOCALAPPDATA 'VirtalTikTok\video-intake\youtube-cookies.txt'
+          if (Test-Path $localCookieFile) {
+            if (Invoke-YtDlpAttempt -Name 'local-cookie-file' -Extra @('--cookies', $localCookieFile)) {
+              exit 0
+            }
+          }
+
+          # Tier 3: Firefox browser session. yt-dlp currently recommends browser cookies
+          # for login/CAPTCHA cases; Firefox avoids Chromium's Windows app-bound cookie encryption.
+          $firefoxProfiles = Join-Path $env:APPDATA 'Mozilla\Firefox\Profiles'
+          if (Test-Path $firefoxProfiles) {
+            if (Invoke-YtDlpAttempt -Name 'firefox-session' -Extra @('--cookies-from-browser', 'firefox')) {
+              exit 0
+            }
+          }
+
+          throw 'Residential direct, local cookie file, and Firefox-session attempts all failed.'
+
+      - name: Build fetch manifest
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $video = Get-ChildItem 'fetched' -File |
+            Where-Object {
+              $_.Name -like 'source.*' -and
+              $_.Extension -notin '.json','.description','.vtt','.webp','.jpg','.jpeg','.png','.txt','.part','.ytdl'
+            } |
+            Select-Object -First 1
+          if (-not $video) { throw 'No fetched source video found.' }
+
+          $sha = (Get-FileHash -Path $video.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+          $captions = @(Get-ChildItem 'fetched' -File -Filter '*.vtt' | ForEach-Object { $_.Name })
+          $manifest = [ordered]@{
+            source_url = $env:VIDEO_URL
+            source_file = $video.Name
+            source_sha256 = $sha
+            fetch_path = 'residential-self-hosted'
+            runner_name = $env:RUNNER_NAME
+            yt_dlp_version = '2026.07.04'
+            captions = $captions
+          }
+          $manifest | ConvertTo-Json -Depth 5 | Set-Content 'fetched/fetch-manifest.json' -Encoding utf8
+
+          # Defense in depth: never let a cookie file enter the artifact folder.
+          Get-ChildItem 'fetched' -File -Filter '*cookie*' -ErrorAction SilentlyContinue | Remove-Item -Force
+
+      - name: Upload fetched source
+        uses: actions/upload-artifact@v4
+        with:
+          name: video-fetch-residential-${{ github.run_id }}
+          path: fetched/
+          if-no-files-found: error
+          retention-days: 7
