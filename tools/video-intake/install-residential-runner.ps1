@@ -97,11 +97,12 @@ Write-Step 'Installing automatic startup for the current Windows user'
 $startupFolder = [Environment]::GetFolderPath('Startup')
 $startupCmd = Join-Path $startupFolder 'VirtalTikTok-Video-Intake-Runner.cmd'
 $runCmd = Join-Path $RunnerRoot 'run.cmd'
-@
-"@echo off
-cd /d `"$RunnerRoot`"
-call `"$runCmd`"
-"@ | Set-Content -Path $startupCmd -Encoding ascii
+$startupLines = @(
+    '@echo off',
+    "cd /d `"$RunnerRoot`"",
+    "call `"$runCmd`""
+)
+$startupLines | Set-Content -Path $startupCmd -Encoding ascii
 
 Write-Step 'Starting the residential runner now'
 $existing = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
@@ -111,7 +112,7 @@ if (-not $existing) {
     Start-Sleep -Seconds 3
 }
 
-Write-Step 'Installing a project-local yt-dlp cache directory'
+Write-Step 'Installing a project-local video intake directory'
 $intakeRoot = Join-Path $env:LOCALAPPDATA 'VirtalTikTok\video-intake'
 New-Item -ItemType Directory -Force -Path $intakeRoot | Out-Null
 
@@ -121,9 +122,9 @@ Write-Host "Runner folder: $RunnerRoot"
 Write-Host "Startup entry: $startupCmd"
 Write-Host ''
 Write-Host 'What this changes:' -ForegroundColor Cyan
-Write-Host '  • Future public video URLs can be fetched from your normal residential connection.'
-Write-Host '  • The workflow tries public download first, so YouTube cookies are not required for normal public videos.'
-Write-Host '  • If login is ever required, the workflow can use a local Firefox session or a local cookie file.'
-Write-Host '  • Browser cookies are never committed to GitHub or uploaded as artifacts.'
+Write-Host '  - Future public video URLs can be fetched from your normal residential connection.'
+Write-Host '  - The workflow tries public download first, so YouTube cookies are not required for normal public videos.'
+Write-Host '  - If login is ever required, the workflow can use a local Firefox session or a local cookie file.'
+Write-Host '  - Browser cookies are never committed to GitHub or uploaded as artifacts.'
 Write-Host ''
 Write-Host 'Keep this runner for the video project only. The workflow accepts only trusted same-repo requests from amirdoit.' -ForegroundColor Yellow
