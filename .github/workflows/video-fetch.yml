@@ -24,15 +24,16 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 12
     env:
-      # Primary cloud path. Apify actor runs YouTube downloads in Apify cloud
-      # with residential proxy support and stores the resulting MP4 remotely.
+      # Primary reliability boundary: Apify cloud actors using residential
+      # proxies / guest-cookie / browser-impersonation strategies.
       APIFY_TOKEN: ${{ secrets.APIFY_TOKEN }}
 
-      # Secondary provider-neutral egress path. Optional. Initial recommended
-      # implementation if needed later: a sticky Decodo residential proxy URL.
+      # Secondary vendor-neutral cloud egress. Optional. A sticky residential
+      # or ISP proxy URL can be supplied without changing this workflow.
       VIDEO_RESIDENTIAL_PROXY_URL: ${{ secrets.VIDEO_RESIDENTIAL_PROXY_URL }}
 
-      # Optional final fallback for genuinely login-gated YouTube content.
+      # Optional only for genuinely login-gated sources. Normal public Shorts
+      # must not depend on this.
       YOUTUBE_COOKIES_B64: ${{ secrets.YOUTUBE_COOKIES_B64 }}
 
     steps:
@@ -77,9 +78,71 @@ jobs:
             exit 0
           fi
 
-          echo '=== attempt: apify-residential-cloud ===' | tee -a fetched/download.log
+          run_actor() {
+            local label="$1"
+            local actor="$2"
+            local input_file="$3"
+            local response_file="$4"
+            echo "=== attempt: $label ===" | tee -a fetched/download.log
+            local status=0
+            curl --fail-with-body --silent --show-error --location \
+              --max-time 330 \
+              --header "Authorization: Bearer $APIFY_TOKEN" \
+              --header 'Content-Type: application/json' \
+              --data "@$input_file" \
+              "https://api.apify.com/v2/acts/$actor/run-sync-get-dataset-items?timeout=300" \
+              > "$response_file" || status=$?
+            if [[ "$status" != 0 ]]; then
+              echo "$label failed with curl status $status" | tee -a fetched/download.log
+              return 1
+            fi
+            return 0
+          }
 
+          # Actor 1: self-healing downloader designed around anonymous guest
+          # cookies, Chrome impersonation, residential proxies and client rotation.
           python - <<'PY'
+          import json, os
+          payload = {
+              'url': os.environ['VIDEO_URL'],
+              'videoQuality': '720',
+              'outputFormat': 'mp4',
+              'proxyConfiguration': {
+                  'useApifyProxy': True,
+                  'apifyProxyGroups': ['RESIDENTIAL'],
+              },
+          }
+          with open('fetched/apify-utils-input.json', 'w', encoding='utf-8') as f:
+              json.dump(payload, f)
+          PY
+
+          if run_actor \
+              apify-utils-residential-cloud \
+              'utils~youtube-video-downloader' \
+              fetched/apify-utils-input.json \
+              fetched/apify-utils-response.json; then
+            python - <<'PY'
+          import json
+          from pathlib import Path
+          p = Path('fetched/apify-utils-response.json')
+          try:
+              data = json.loads(p.read_text(encoding='utf-8'))
+          except Exception:
+              data = []
+          row = data[0] if isinstance(data, list) and data else {}
+          media = row.get('downloadUrl') or row.get('download_url') or row.get('mediaUrl') or ''
+          if media:
+              Path('fetched/apify-media-url.txt').write_text(media, encoding='utf-8')
+              Path('fetched/apify-actor.txt').write_text('utils/youtube-video-downloader', encoding='utf-8')
+          PY
+          fi
+          rm -f fetched/apify-utils-input.json
+
+          # Actor 2: independent yt-dlp + residential-proxy implementation.
+          # It is deliberately a second Apify actor so one actor regression does
+          # not take down reference-video intake.
+          if [[ ! -s fetched/apify-media-url.txt ]]; then
+            python - <<'PY'
           import json, os
           payload = {
               'urls': [os.environ['VIDEO_URL']],
@@ -88,51 +151,42 @@ jobs:
               'subtitles': True,
               'subLangs': 'en',
               'includeMetadata': True,
-              # Cost/safety ceiling. Typical Shorts are only a few MB.
               'maxMegabytes': 150,
               'proxyConfiguration': {
                   'useApifyProxy': True,
                   'apifyProxyGroups': ['RESIDENTIAL'],
               },
           }
-          with open('fetched/apify-input.json', 'w', encoding='utf-8') as f:
+          with open('fetched/apify-dami-input.json', 'w', encoding='utf-8') as f:
               json.dump(payload, f)
           PY
 
-          status=0
-          curl --fail-with-body --silent --show-error --location \
-            --max-time 330 \
-            --header "Authorization: Bearer $APIFY_TOKEN" \
-            --header 'Content-Type: application/json' \
-            --data @fetched/apify-input.json \
-            'https://api.apify.com/v2/acts/dami_studio~youtube-video-downloader/run-sync-get-dataset-items?timeout=300' \
-            > fetched/apify-response.json || status=$?
-
-          rm -f fetched/apify-input.json
-
-          if [[ "$status" != 0 ]]; then
-            echo "Apify request failed with curl status $status" | tee -a fetched/download.log
-            exit 0
-          fi
-
-          python - <<'PY'
+            if run_actor \
+                apify-dami-residential-cloud \
+                'dami_studio~youtube-video-downloader' \
+                fetched/apify-dami-input.json \
+                fetched/apify-dami-response.json; then
+              python - <<'PY'
           import json
           from pathlib import Path
-          p = Path('fetched/apify-response.json')
+          p = Path('fetched/apify-dami-response.json')
           try:
               data = json.loads(p.read_text(encoding='utf-8'))
-          except Exception as exc:
-              print(f'Invalid Apify JSON: {exc}')
-              raise SystemExit(0)
+          except Exception:
+              data = []
           row = data[0] if isinstance(data, list) and data else {}
-          media = row.get('mediaUrl') or row.get('download_url') or row.get('downloadUrl') or ''
+          media = row.get('mediaUrl') or row.get('downloadUrl') or row.get('download_url') or ''
           if media:
               Path('fetched/apify-media-url.txt').write_text(media, encoding='utf-8')
-          print('Apify dataset row received:', bool(row), 'media URL:', bool(media))
+              Path('fetched/apify-actor.txt').write_text('dami_studio/youtube-video-downloader', encoding='utf-8')
           PY
+            fi
+            rm -f fetched/apify-dami-input.json
+          fi
 
           if [[ ! -s fetched/apify-media-url.txt ]]; then
-            echo 'Apify actor returned no downloadable media URL.' | tee -a fetched/download.log
+            echo 'Both Apify actors returned no downloadable media URL.' |
+              tee -a fetched/download.log
             exit 0
           fi
 
@@ -190,7 +244,7 @@ jobs:
             is_youtube=1
           fi
 
-          # Secondary cloud reliability boundary: residential/ISP proxy egress.
+          # Secondary reliability boundary: provider-neutral residential/ISP egress.
           if [[ "$is_youtube" == 1 && -n "${VIDEO_RESIDENTIAL_PROXY_URL:-}" ]]; then
             echo 'Secondary residential cloud egress: configured' | tee -a fetched/download.log
             attempt residential-default \
@@ -222,8 +276,7 @@ jobs:
             rm -f fetched/youtube-cookies.txt
           fi
 
-          # Free/best-effort routes. These are useful but not treated as the
-          # production reliability boundary.
+          # Free/best-effort routes. Useful, but not production reliability boundaries.
           attempt direct && exit 0
 
           if [[ "$is_youtube" == 1 ]]; then
@@ -234,8 +287,7 @@ jobs:
             fi
           fi
 
-          # Last free fallback: PO-token provider. Media requests still use the
-          # residential proxy when one is configured.
+          # Last free fallback: PO-token provider.
           if [[ "$is_youtube" == 1 ]]; then
             python -m pip install --disable-pip-version-check 'bgutil-ytdlp-pot-provider==1.3.1'
             docker run -d --name bgutil-provider -p 4416:4416 --init \
@@ -286,11 +338,14 @@ jobs:
           video=Path('$VIDEO')
           h=hashlib.sha256(video.read_bytes()).hexdigest()
           vtts=sorted(str(p.name) for p in Path('fetched').glob('*.vtt'))
+          actor_file=Path('fetched/apify-actor.txt')
+          actor=actor_file.read_text(encoding='utf-8').strip() if actor_file.exists() else None
           manifest={
               'source_url': os.environ['VIDEO_URL'],
               'source_file': video.name,
               'source_sha256': h,
               'fetch_path': 'apify-cloud' if os.environ.get('APIFY_FETCHED') == '1' else 'github-cloud-fallback',
+              'apify_actor': actor,
               'apify_configured': bool(os.environ.get('APIFY_TOKEN')),
               'secondary_residential_proxy_configured': bool(os.environ.get('VIDEO_RESIDENTIAL_PROXY_URL')),
               'yt_dlp_version': '2026.07.04',
